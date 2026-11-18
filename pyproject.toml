@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pmoagent"
+version = "0.1.0"
+description = "Teams PMO assistant powered by Claude Agent SDK on Foundry"
+requires-python = ">=3.12"
+dependencies = [
+  "pydantic-settings>=2.7,<3",
+  "python-dotenv>=1,<2",
+  "azure-identity>=1.21,<2",
+  "aiohttp>=3.11,<4",
+  "httpx>=0.28,<1",
+  "azure-storage-blob>=12.25,<13",
+  "microsoft-agents-hosting-aiohttp==1.9.0",
+  "microsoft-agents-authentication-msal==1.9.0",
+  "claude-agent-sdk==0.2.182",
+  "opentelemetry-api>=1.30,<2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "pytest-asyncio>=0.25,<2", "ruff>=0.11", "mypy>=1.15"]
+
+[project.scripts]
+pmo-agent = "pmoagent.host:main"
+pmo-autopilot = "pmoagent.autopilot:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+markers = ["storage: requires an isolated Azurite instance (PMO_TEST_STORAGE_CONNECTION)"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+# Line length is enforced by `ruff format`; long Japanese strings are left intact.
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+ignore_missing_imports = true
