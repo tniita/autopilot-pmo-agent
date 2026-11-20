@@ -19,6 +19,7 @@ from microsoft_agents.hosting.aiohttp import (
 from microsoft_agents.hosting.core import (
     AgentApplication,
     Authorization,
+    ClaimsIdentity,
     MemoryStorage,
     TurnContext,
     TurnState,
@@ -27,10 +28,12 @@ from microsoft_agents.hosting.core import (
 from pmoagent.agent import ReportGenerator
 from pmoagent.bot import PmoBot
 from pmoagent.config import Settings
+from pmoagent.gpt import GptReportGenerator
 from pmoagent.store import ConversationStore
 
 logger = logging.getLogger(__name__)
 PUBLIC_PATHS = {"/readiness", "/liveness"}
+ACTIVITY_PATHS = {"/activity/messages", "/api/messages"}
 MAX_INPUT_CHARS = 2000
 
 # Microsoft 365 Agents SDK settings used by Foundry autopilot agents (see the official sample).
@@ -70,6 +73,24 @@ def conversation_key(activity: Activity) -> str:
     return f"{instance}:{tenant}:{conversation.id if conversation else ''}"
 
 
+def teams_location(activity: Activity) -> str:
+    data = activity.channel_data if isinstance(activity.channel_data, dict) else {}
+    team = data.get("team") or {}
+    channel = data.get("channel") or {}
+    logger.info(
+        "teams_location channel_data=%s keys=%s team_keys=%s",
+        type(activity.channel_data).__name__,
+        sorted(data),
+        sorted(team) if isinstance(team, dict) else type(team).__name__,
+    )
+    if team.get("aadGroupId") and channel.get("id"):
+        return f"Teamsチャネル（team-id: {team['aadGroupId']}, channel-id: {channel['id']}）"
+    conversation = activity.conversation
+    if conversation and conversation.id:
+        return f"Teamsチャット（chat-id: {conversation.id.split(';')[0]}）"
+    return ""
+
+
 async def handle_message(
     context: TurnContext,
     settings: Settings,
@@ -102,7 +123,12 @@ async def handle_message(
     typing_task = asyncio.create_task(typing())
     try:
         reply = await bot.respond(
-            text, sender.aad_object_id, sender.name or "依頼者", conversation_key(activity), tokens
+            text,
+            sender.aad_object_id,
+            sender.name or "依頼者",
+            conversation_key(activity),
+            tokens,
+            location=teams_location(activity),
         )
     finally:
         typing_task.cancel()
@@ -111,8 +137,14 @@ async def handle_message(
     await context.send_activity(reply)
 
 
+def foundry_gateway_ingress(settings: Settings, environ: dict[str, str]) -> bool:
+    return settings.environment == "azure" and bool(environ.get("FOUNDRY_HOSTING_ENVIRONMENT"))
+
+
 def build_app(settings: Settings, environ: dict[str, str] | None = None) -> web.Application:
-    config = sdk_configuration(dict(environ if environ is not None else os.environ))
+    environ = dict(environ if environ is not None else os.environ)
+    config = sdk_configuration(environ)
+    gateway = foundry_gateway_ingress(settings, environ)
     connections = MsalConnectionManager(**config)
     adapter = CloudAdapter(connection_manager=connections)
     sdk_storage = MemoryStorage()
@@ -122,7 +154,12 @@ def build_app(settings: Settings, environ: dict[str, str] | None = None) -> web.
     )
     credential = credential_for(settings)
     store = ConversationStore.from_settings(settings, credential)
-    bot = PmoBot(settings, store, ReportGenerator(settings))
+    generator = (
+        GptReportGenerator(settings, credential)
+        if settings.provider == "gpt"
+        else ReportGenerator(settings)
+    )
+    bot = PmoBot(settings, store, generator)
 
     async def exchange(context: TurnContext, scope: str) -> str:
         response = await agent_app.auth.exchange_token(
@@ -142,9 +179,24 @@ def build_app(settings: Settings, environ: dict[str, str] | None = None) -> web.
     ) -> web.StreamResponse:
         if request.method == "GET" and request.path in PUBLIC_PATHS:
             return await handler(request)
-        response = await jwt_authorization_middleware(request, handler)
+        is_activity = request.method == "POST" and request.path in ACTIVITY_PATHS
+        if gateway and is_activity:
+            # Foundry authenticates channel traffic at its edge and does not forward the
+            # channel JWT; mirror azure-ai-agentserver-activity's digital-worker claims.
+            request["claims_identity"] = ClaimsIdentity({}, authentication_type="Anonymous")
+            response = await handler(request)
+        else:
+            response = await jwt_authorization_middleware(request, handler)
         if not isinstance(response, web.StreamResponse):
-            raise TypeError("JWT middleware returned an invalid response")
+            raise TypeError("Activity middleware returned an invalid response")
+        if is_activity:
+            logger.info(
+                "activity_ingress path=%s mode=%s authorization_present=%s status=%d",
+                request.path,
+                "foundry" if gateway else "jwt",
+                "Authorization" in request.headers,
+                response.status,
+            )
         return response
 
     auth_config = connections.get_default_connection_configuration()

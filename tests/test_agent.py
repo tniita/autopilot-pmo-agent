@@ -43,9 +43,12 @@ async def guard_decision(settings, tool: str, tool_input: dict[str, Any]) -> str
     ("tool", "decision"),
     [
         ("mcp__ado__wit_work_item", None),
+        ("mcp__teams__ListChatMessages", None),
+        ("mcp__calendar__ListCalendarView", None),
         ("mcp__ado__wit_work_item_write", "deny"),
-        ("mcp__teams__mcp_graph_chat_postMessage", "deny"),
-        ("mcp__calendar__mcp_CalendarTools_graph_createEvent", "deny"),
+        ("mcp__teams__SendMessageToChat", "deny"),
+        ("mcp__teams__SearchTeamsMessages", "deny"),
+        ("mcp__calendar__CreateEvent", "deny"),
         ("mcp__other__anything", "deny"),
     ],
 )

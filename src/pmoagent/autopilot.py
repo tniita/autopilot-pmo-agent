@@ -40,7 +40,8 @@ def runtime_environment(args: argparse.Namespace, runtime_client_id: str | None)
         "PYTHONNOUSERSITE": "1",
         "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT": "false",
         "PMO_ENVIRONMENT": "azure",
-        "PMO_ANTHROPIC_MODEL": args.model,
+        "PMO_PROVIDER": args.provider,
+        ("PMO_GPT_MODEL" if args.provider == "gpt" else "PMO_ANTHROPIC_MODEL"): args.model,
         "PMO_ADO_ORGANIZATION": args.ado_organization,
         "PMO_STORAGE_ACCOUNT_NAME": args.storage_account,
     }
@@ -62,7 +63,7 @@ def version_body(args: argparse.Namespace, runtime_client_id: str | None) -> dic
             "container_protocol_versions": [{"protocol": "activity_protocol", "version": "2.0.0"}],
         },
         "metadata": {"enableVnextExperience": "true"},
-        "description": "PMO agent (Claude Agent SDK) autopilot blueprint.",
+        "description": f"PMO agent ({args.provider}) autopilot blueprint.",
         "agent_endpoint": endpoint_body(authorized=False),
         "digital_worker_type": "m365",
     }
@@ -221,7 +222,8 @@ def parser() -> argparse.ArgumentParser:
     create_cmd.add_argument(
         "--image", required=True, help="ACR image, for example x.azurecr.io/pmo-agent:1"
     )
-    create_cmd.add_argument("--model", required=True, help="Claude deployment name")
+    create_cmd.add_argument("--provider", choices=("claude", "gpt"), default="claude")
+    create_cmd.add_argument("--model", required=True, help="Foundry model deployment name")
     create_cmd.add_argument("--ado-organization", required=True)
     create_cmd.add_argument("--ado-project")
     create_cmd.add_argument("--storage-account", required=True)

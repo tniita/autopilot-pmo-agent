@@ -1,6 +1,6 @@
 # PMO Agent（Autopilot版）
 
-Claude Agent SDK で実装した Microsoft Foundry Hosted Agent を、**Agent 365 の Autopilot（グループ型）**として動かす MVP です。
+Microsoft Foundry Hosted Agent を **Agent 365 の Autopilot（グループ型）**として動かす MVP です。報告生成には Claude Agent SDK（既定）または OpenAI Python SDK と GPT を使います。デプロイ時に選択し、モデル間の自動切り替えは行いません。
 プロジェクトごとに作成したインスタンスがチームの Teams チャットに参加し、@メンションされると、Azure DevOps と Microsoft 365（Work IQ 系 MCP）を**エージェント自身のユーザーアカウントの権限**で読み取り、根拠付きの報告ドラフトを作成します。
 
 **このリポジトリは Azure リソースの作成・デプロイ・公開を自動実行しません。**
@@ -10,11 +10,11 @@ Claude Agent SDK で実装した Microsoft Foundry Hosted Agent を、**Agent 36
 
 ```mermaid
 flowchart LR
-    U[Teams グループチャット<br/>@メンション] -->|Activity プロトコル| A[PMO Hosted Agent<br/>Microsoft 365 Agents SDK + Claude Agent SDK]
+    U[Teams グループチャット<br/>@メンション] -->|Activity プロトコル| A[PMO Hosted Agent<br/>Microsoft 365 Agents SDK]
     A -->|エージェントユーザーのトークン| D[Azure DevOps リモート MCP]
     A -->|エージェントユーザーのトークン| W[Work IQ 系 MCP<br/>Teams・Outlook 予定表]
     A -->|既定インスタンスの ID| B[(Blob: ドラフトと承認記録)]
-    A --> C[Foundry 上の Claude]
+    A -->|既定インスタンスの ID| C[Foundry 上の Claude または GPT]
 ```
 
 - **ブループリントとインスタンス**: このコードはブループリントです。チームはそこからインスタンスを作成（採用）します。
@@ -44,13 +44,13 @@ flowchart LR
 
 - Claude の組み込みツール（シェル、ファイル操作など）は無効です。外部 MCP 設定やローカル設定も読み込みません。
 - MCP ツールは**許可リストにある読み取り用ツールだけ**を自動承認し、それ以外は拒否します。
-  さらに `PreToolUse` フックで、許可リスト外のツールを明示的に拒否します。
+  Claude では `PreToolUse` フック、GPT ではアプリ側の関数呼び出し処理が実行前に検査します。GPT には許可した関数の定義と結果を渡し、エージェントユーザーの Bearer トークンは渡しません。
 
   | サーバー | 既定で許可するツール（いずれも参照系） |
   | --- | --- |
   | `ado` | `wit_work_item`, `wit_query`, `wit_backlog` |
-  | `teams` | `mcp_graph_chat_getChat` / `getChatMessage` / `listChatMessages` / `listChats`、`mcp_graph_teams_getChannel` / `getTeam` / `listChannelMessages` / `listChannels` |
-  | `calendar` | `mcp_CalendarTools_graph_getEvent` / `listCalendarView` / `listEvents` |
+  | `teams` | `GetChat` / `GetChatMessage` / `ListChatMessages` / `ListChats`、`GetChannel` / `GetTeam` / `ListChannelMessages` / `ListChannelMessageReplies` / `ListChannels` |
+  | `calendar` | `ListCalendarView` / `ListEvents` |
 
   メッセージ投稿、予定作成、Work Item 更新などの書き込み系は許可しません。
   ツール名が変わった場合、そのツールは使えなくなるだけで、意図しないツールが有効になることはありません。
@@ -68,34 +68,53 @@ flowchart LR
 | --- | --- |
 | プログラム・ライセンス | テナントの **Frontier プレビュー**登録と Agent 365 利用規約への同意、Microsoft 365 Copilot または Agent 365 ライセンス、インスタンス数分の Agent 365 Frontier ライセンス（プレビューは 25 席） |
 | 管理者 | ブループリントを承認するグローバル管理者または AI 管理者 |
-| Azure | Hosted Agent の提供リージョンにある Foundry プロジェクト、Claude のモデルデプロイ、ACR、Storage アカウント |
+| Azure | Hosted Agent の提供リージョンにある Foundry プロジェクト、Claude または GPT のモデルデプロイ、ACR、Storage アカウント |
 | Azure DevOps | Entra テナントに接続された組織。各インスタンスのエージェントユーザーを対象プロジェクトに追加し、アクセスレベルを割り当て |
 
 ## Azure 環境の新規構築（Bicep）
 
-[infra/main.bicep](infra/main.bicep) は専用リソースグループに Foundry アカウントとプロジェクト、同一アカウント内の Claude、Basic ACR、Storage と `pmo-conversations` を作ります。プロジェクトのマネージド ID にだけ ACR の `AcrPull` を付与します。Storage の匿名 Blob アクセス・共有キー、ACR の管理者アカウント、Foundry のローカル認証は無効です。**Private Endpoint は作成しません**。公開ネットワークを禁止する環境では、適用前に Hosted Agent とビルド端末からのプライベート接続・DNS を設計してください。
+[infra/main.bicep](infra/main.bicep) は専用リソースグループに Foundry アカウントとプロジェクト、選択したモデル、Basic ACR、Storage と `pmo-conversations` を作ります。プロジェクトのマネージド ID にだけ ACR の `AcrPull` を付与します。Storage の匿名 Blob アクセス・共有キー、ACR の管理者アカウント、Foundry のローカル認証は無効です。**Private Endpoint は作成しません**。公開ネットワークを禁止する環境では、適用前に Hosted Agent とビルド端末からのプライベート接続・DNS を設計してください。
 
 1. Azure CLI 2.53 以降、Bicep CLI、Docker を用意し、対象サブスクリプションにログインします。構築者にはリソースの作成とロール割り当ての権限が必要です。イメージを push する利用者には別途 ACR の `AcrPush`、エージェントの作成者にはプロジェクトの操作権限が必要です。
-2. [infra/main.bicepparam](infra/main.bicepparam) のリージョン、Claude のモデル名・版・容量を確認します。例の値は提供を保証しません。**Hosted Agent と選択モデルの両方が利用可能なリージョン**を選び、[Claude の購入資格・Marketplace 条件](https://learn.microsoft.com/azure/foundry/foundry-models/how-to/use-foundry-models-claude)とクォータを確認してください。以下の組織情報には実際の値を設定します。Marketplace で規約への同意が必要な場合は、権限のある担当者が確認・同意してください。
+2. **以下のどちらか一方**を同じ Bash セッションで設定します。どちらも Hosted Agent と対象モデルの提供リージョン、Global Standard のバージョンとクォータを確認してください。
+
+    **Claude 版**：[infra/main.bicepparam](infra/main.bicepparam) のモデル名・版・容量を確認し、[Marketplace の条件](https://learn.microsoft.com/azure/foundry/foundry-models/how-to/use-foundry-models-claude)に従って実際の組織情報を指定します。
 
     ```bash
     export CLAUDE_ORGANIZATION='<法人名>' CLAUDE_COUNTRY_CODE='<2文字の国コード>' CLAUDE_INDUSTRY='<業種>'
+    PROVIDER=claude PARAMS=infra/main.bicepparam AGENT_NAME=pmo-agent DISPLAY_NAME='PMO Agent'
+    INFERENCE_ROLE='Cognitive Services User'
+    ```
+
+    **GPT 版**：[infra/gpt.bicepparam](infra/gpt.bicepparam) を使います。Claude の購入・組織情報は不要です。モデルには Responses API、関数呼び出し、JSON モードが必要です（推論モデルは Chat Completions で関数呼び出しを拒否するため、Responses API を使います）。次は記入例であり、実際に提供されている名前・版に置き換えてください。カタログ名とは別に、このファイルでデプロイ名 `pmo-gpt` を指定しています。
+
+    ```bash
+    export PMO_GPT_CATALOG_MODEL=gpt-4.1 PMO_GPT_MODEL_VERSION=2025-04-14
+    PROVIDER=gpt PARAMS=infra/gpt.bicepparam AGENT_NAME=pmo-agent-gpt DISPLAY_NAME='PMO Agent GPT'
+    INFERENCE_ROLE='Cognitive Services OpenAI User'
+    ```
+
+    **共通：** 対象を確認して差分を表示します。両版を並べる場合は同じ RG・リージョンと異なるモデルデプロイ名を使い、以下の構築から公開までを各版について実行します。
+
+    ```bash
     RG=rg-pmo-dev
     az account show --query '{subscription:name,id:id,tenant:tenantId}' -o table
     # 専用 RG がまだない場合だけ作成
     az group create --name "$RG" --location swedencentral
-    az deployment group what-if -g "$RG" --parameters infra/main.bicepparam
+    az deployment group what-if -g "$RG" --parameters "$PARAMS"
     ```
 
-3. 差分と課金対象を確認した後にだけ適用します。次節は同じ Bash セッションで実行します。
+3. 差分と課金対象を確認した後にだけ適用します。基盤だけを作る場合は `what-if` と `create` の両方で `--parameters "$PARAMS"` の後に `deployModel=false` を追加します。この場合 `modelDeploymentName` は空です。次節の `--model` には別途用意した同一アカウント内のデプロイ名を指定してください。
 
     ```bash
-    az deployment group create -g "$RG" -n pmo-infra --parameters infra/main.bicepparam
-    out() { az deployment group show -g "$RG" -n pmo-infra --query "properties.outputs.$1.value" -o tsv; }
+    az deployment group create -g "$RG" -n "pmo-infra-$PROVIDER" --parameters "$PARAMS"
+    out() { az deployment group show -g "$RG" -n "pmo-infra-$PROVIDER" --query "properties.outputs.$1.value" -o tsv; }
     IMAGE=$(out image)
     ```
 
 リソース名は RG の ID から生成するため、同じ RG への再適用は同じ環境を対象にします。Bicep の版によっては `modelProviderData` に型警告 `BCP037` が出ますが、[公式 Bicep サンプル](https://github.com/Azure-Samples/claude/blob/main/infra-bicep/infra/foundry.bicep)と同じプロバイダー情報を ARM に渡します。Bicep はエージェントの公開、管理者同意、ライセンス割り当ては行いません。
+
+> **Storage の公開ネットワークアクセス：** Hosted Agent のコンテナーは、会話用 Blob に公開エンドポイント経由で接続します。Azure Policy（例：MCAPSGov の `StorageAccount_PublicNetwork_Modify`）が `publicNetworkAccess` を `Disabled` に書き換える環境では、Bicep の適用は成功しても、最初の依頼で Blob が `403 AuthorizationFailure` になります。組織の規定に従い、ポリシーの除外またはプライベート接続を用意してください。手順は「[手作業で行う設定](#手作業で行う設定)」を参照してください。
 
 ## エージェントのデプロイ手順
 
@@ -116,11 +135,13 @@ flowchart LR
 
    ```bash
    pmo-autopilot create --project-endpoint "$(out projectEndpoint)" \
-     --image "$IMAGE" --model "$(out modelDeploymentName)" \
-     --ado-organization '<Azure DevOps 組織名>' --storage-account "$(out storageAccountName)"   # 確認後に --apply
+    --name "$AGENT_NAME" --provider "$PROVIDER" --image "$IMAGE" --model "$(out modelDeploymentName)" \
+     --ado-organization '<Azure DevOps 組織名>' --ado-project '<Azure DevOps プロジェクト名>' \
+     --storage-account "$(out storageAccountName)"   # 確認後に --apply
    ```
 
    実行すると、`blueprint_client_id` と `runtime_client_id` が表示されます。
+   `--ado-project` には Azure DevOps 上の**正確なプロジェクト名**を指定します。指定しないと、モデルが依頼文中の通称をそのまま使い、`TF200016`（プロジェクトが存在しない）になることがあります。
 4. **既定インスタンスの ID に権限を付与します**（プロジェクトの Foundry User、会話用コンテナーの Storage Blob Data Contributor）。
 
    ```bash
@@ -130,27 +151,116 @@ flowchart LR
      --storage-account-id "$(out storageAccountId)"   # 確認後に --apply
    ```
 
-   Claude の推論先はプロジェクトではなく親アカウントの `/anthropic` です。プロジェクトのロールは親に継承されないため、この新規環境では実行 ID にアカウントスコープの推論権限も付与します（以下は実際に権限を変更します）。
+    Claude は親アカウントの `/anthropic`、GPT は `/openai/v1/` を使います。プロジェクトのロールは親に継承されないため、選択した版の実行 ID にだけ、上で設定した推論ロールをアカウントスコープで付与します（以下は実際に権限を変更します）。
 
    ```bash
    PRINCIPAL_ID=$(az ad sp show --id "$RUNTIME_CLIENT_ID" --query id -o tsv)
    az role assignment create --assignee-object-id "$PRINCIPAL_ID" --assignee-principal-type ServicePrincipal \
-     --role 'Cognitive Services User' --scope "$(out foundryAccountId)"
+    --role "$INFERENCE_ROLE" --scope "$(out foundryAccountId)"
    ```
 5. **Autopilot として公開します。**
    要求するアクセス許可は、Teams・予定表（`McpServers.Teams.All`, `McpServers.Calendar.All`）と Azure DevOps（`Ado.Mcp.Tools`）だけです。
+   公開前に、テナントに **Azure DevOps MCP** のエンタープライズアプリがあることを確認します（「[手作業で行う設定](#手作業で行う設定)」の 1）。ないと、承認時に Azure DevOps への同意を付与できません。
 
    ```bash
-   pmo-autopilot publish --project-endpoint <プロジェクトのエンドポイント> \
-     --blueprint-client-id <blueprint_client_id> --developer <組織名> \
-     --website https://<自社サイト> --privacy-url https://<…>/privacy --terms-url https://<…>/terms   # 確認後に --apply
+   pmo-autopilot publish --project-endpoint "$(out projectEndpoint)" --name "$AGENT_NAME" \
+     --display-name "$DISPLAY_NAME" --blueprint-client-id '<この版の create が返した blueprint_client_id>' \
+     --developer '<組織名>' --website 'https://example.com' \
+     --privacy-url 'https://example.com/privacy' --terms-url 'https://example.com/terms'   # 自社 URL に替え、確認後に --apply
    ```
 
 6. **管理者が承認します。**
    [Microsoft 365 管理センター](https://admin.cloud.microsoft/?#/agents/all/requested)の Requests で承認します。
    採用できる人の範囲とポリシーを設定し、アクセス許可に管理者の同意を与えます。
+   承認後、Azure DevOps MCP への同意と継承の設定がブループリントに入っていることを確認します（「[手作業で行う設定](#手作業で行う設定)」の 2）。
 7. **チームがインスタンスを作成します。**
    Teams の **Apps → Agents for your team** から作成し、エージェントユーザーをチームのチャット、チャネル、Azure DevOps プロジェクトに追加します。
+
+  GPT 版は `@PMO Agent GPT`（実際のインスタンス名）でメンションします。比較する場合は各版を個別に採用し、それぞれのエージェントユーザーに同じデモデータへの読み取り権限を付けてください。以下の原典照合・差戻し・承認を各版で確認します。
+
+## 手作業で行う設定
+
+次の設定は Bicep も `pmo-autopilot` も行いません。テナントや組織の統制に関わるため、影響を確認してから実施してください。
+
+| # | 設定 | 実施者・必要な権限 | タイミング | 影響範囲 |
+| --- | --- | --- | --- | --- |
+| 1 | Azure DevOps MCP のエンタープライズアプリを作成 | アプリケーション管理者以上 | 公開前、テナントに 1 回 | テナント全体 |
+| 2 | ブループリントに Azure DevOps MCP の同意と継承を設定 | アプリケーション管理者＋Agent ID 管理者 | 承認後、確認して不足していれば | このブループリントの全インスタンス |
+| 3 | 会話用 Storage の公開ネットワークアクセス | Storage の共同作成者以上 | ポリシーで無効化される環境だけ | 対象の Storage アカウント |
+| 4 | エージェントユーザーを Azure DevOps・Teams・予定表に参加させる | 各リソースの管理者 | インスタンス作成後 | そのインスタンスの読み取り範囲 |
+
+### 1. Azure DevOps MCP のエンタープライズアプリ
+
+テナントにアプリ（アプリ ID `2a72489c-aab2-4b65-b93a-a91edccf33b8`）がないと、Azure DevOps への同意を付与できず、トークン取得が `AADSTS65001` で失敗します。[公式の手順](https://learn.microsoft.com/azure/devops/mcp-server/remote-mcp-server-troubleshooting#cant-find-the-azure-devops-mcp-enterprise-application-in-the-tenant)で作成します。
+
+```bash
+az rest --method get --url "https://graph.microsoft.com/v1.0/servicePrincipals(appId='2a72489c-aab2-4b65-b93a-a91edccf33b8')"   # 404 なら未作成
+az ad sp create --id 2a72489c-aab2-4b65-b93a-a91edccf33b8
+```
+
+### 2. ブループリントへの Azure DevOps MCP の同意と継承
+
+承認後に、ブループリントのサービスプリンシパルへの同意と、インスタンスへの継承を確認します。必要なのは `Ado.Mcp.Tools`（接続）と `wit.read`（Work Item の読み取り）だけです。どちらかがなければ追加します。
+
+```bash
+BLUEPRINT='<blueprint_client_id>'
+BP_SP=$(az ad sp show --id "$BLUEPRINT" --query id -o tsv)
+BP_APP=$(az rest --method get --url "https://graph.microsoft.com/beta/applications(appId='$BLUEPRINT')?\$select=id" --query id -o tsv)
+ADO_SP=$(az ad sp show --id 2a72489c-aab2-4b65-b93a-a91edccf33b8 --query id -o tsv)
+
+# 確認：同意と継承
+az rest --method get --url "https://graph.microsoft.com/v1.0/oauth2PermissionGrants?\$filter=clientId eq '$BP_SP'" \
+  --query "value[?resourceId=='$ADO_SP'].scope"
+az rest --method get --url "https://graph.microsoft.com/beta/applications/$BP_APP/microsoft.graph.agentIdentityBlueprint/inheritablePermissions" \
+  --query "value[?resourceAppId=='2a72489c-aab2-4b65-b93a-a91edccf33b8'].inheritableScopes.scopes"
+
+# 不足している場合だけ：全ユーザー対象の管理者同意と、インスタンスへの継承
+az rest --method post --url https://graph.microsoft.com/v1.0/oauth2PermissionGrants --headers Content-Type=application/json \
+  --body "{\"clientId\":\"$BP_SP\",\"consentType\":\"AllPrincipals\",\"resourceId\":\"$ADO_SP\",\"scope\":\"Ado.Mcp.Tools wit.read\"}"
+az rest --method post --url "https://graph.microsoft.com/beta/applications/$BP_APP/microsoft.graph.agentIdentityBlueprint/inheritablePermissions" \
+  --headers Content-Type=application/json \
+  --body '{"resourceAppId":"2a72489c-aab2-4b65-b93a-a91edccf33b8","inheritableScopes":{"@odata.type":"microsoft.graph.enumeratedScopes","scopes":["Ado.Mcp.Tools","wit.read"]}}'
+```
+
+継承の設定には [Agent ID 管理者](https://learn.microsoft.com/graph/api/agentidentityblueprint-post-inheritablepermissions?view=graph-rest-beta)ロールが必要です。Teams・予定表（Agent Tools）の同意は、承認時に自動で付与されます。
+
+### 3. 会話用 Storage の公開ネットワークアクセス
+
+Azure Policy が `publicNetworkAccess` を `Disabled` に書き換える環境だけで必要です。次は MCAPSGov の例で、ポリシーが定める除外タグ `SecurityControl=Ignore` を付けてから有効にします。共有キー認証は無効のままで、Entra ID による認証が必要な状態は変わりません。
+
+```bash
+ST="$(out storageAccountName)"
+az resource tag --is-incremental --tags SecurityControl=Ignore --ids "$(out storageAccountId)"
+az storage account update -n "$ST" -g "$RG" --public-network-access Enabled
+az storage account show -n "$ST" -g "$RG" --query '{pna:publicNetworkAccess,sharedKey:allowSharedKeyAccess}'
+```
+
+これは組織のセキュリティ統制からの除外です。本番では、組織の承認を得るか、プライベート接続を設計してください。デモ用に付けた場合は、終了後にタグを外します。外すと公開アクセスがポリシーで無効に戻り、エージェントは会話を保存できなくなります。
+
+```bash
+az tag update --resource-id "$(out storageAccountId)" --operation Delete --tags SecurityControl=Ignore
+```
+
+### 4. エージェントユーザーの参加
+
+インスタンスが読めるのは、エージェントユーザーに与えた範囲だけです。
+
+- **Azure DevOps：** 組織にアクセスレベル付きで追加し、対象プロジェクトの Readers に加えます。
+- **Teams：** 依頼を受けるチャネルまたはチャットに参加させます。エージェントは、依頼を受けた場所（チャネルは team-id と channel-id、チャットは chat-id）を使って投稿を読みます。
+- **予定表：** 参照させたい会議に招待します。
+
+### 症状から原因を引く
+
+ログはセッション単位です（`GET {project}/agents/{name}/sessions/{id}:logstream?api-version=v1&type=console`）。セッション一覧（`/endpoint/sessions`）は既定で古いものから返るため、新しいセッションは `order=desc` で探します。
+
+| 症状（Teams の返信またはログ） | 主な原因 | 対処 |
+| --- | --- | --- |
+| 返信がない。ログに `activity_ingress … status=401` | ローカル用の JWT 検証が効いている（Foundry は入口で認証済みで、コンテナーに `Authorization` を渡さない） | `PMO_ENVIRONMENT=azure` で、Foundry 上で動いているか確認 |
+| 「接続できませんでした」。ログに Blob の `AuthorizationFailure` | Storage の公開アクセスが無効 | 上記 3 |
+| 「接続できませんでした」。ログに `AADSTS65001` | Azure DevOps MCP の同意がない | 上記 1・2 |
+| Azure DevOps の結果が `TF200016` | プロジェクト名の誤り | `--ado-project` に正確な名前を指定 |
+| 「Teams・予定表を参照できません」。ログの `mcp_tools enabled=` に Teams・予定表がない | 許可リストと実際のツール名が不一致 | `mcp_tools server=… offered=` の名前で `PMO_ALLOWED_TOOLS` を見直す |
+| 「根拠を確認できる報告を作成できませんでした」 | 報告の根拠がツールの結果と一致しない | ログの `report_rejected reason=` を確認 |
 
 ## デモの事前準備：顧客ポータルのリリース判定
 
@@ -178,7 +288,7 @@ flowchart LR
 
 1. **管理者が Foundry と Agent 365 の権限の違いを示します。** 設定済みの内容を表示するだけで、実演中に権限は追加しません。
 
-    - **Azure ポータル：** 対象リソースの「アクセス制御 (IAM)」で、プロジェクトのマネージド ID に付けた ACR の `AcrPull` と、既定インスタンスの実行 ID に付けたプロジェクトの `Foundry User`、親アカウントの `Cognitive Services User`、会話用コンテナーの `Storage Blob Data Contributor` を示します。これらは Teams や Boards の閲覧権限ではありません。
+    - **Azure ポータル：** 対象リソースの「アクセス制御 (IAM)」で、プロジェクトのマネージド ID の `AcrPull` と、既定インスタンスの実行 ID の `Foundry User`（プロジェクト）、推論ロール（親アカウント：Claude は `Cognitive Services User`、GPT は `Cognitive Services OpenAI User`）、`Storage Blob Data Contributor`（会話用コンテナー）を示します。これらは Teams や Boards の閲覧権限ではありません。
     - **Microsoft 365 管理センター：** [ブループリントの承認](https://learn.microsoft.com/azure/foundry/agents/how-to/agent-365#approve-the-blueprint)で設定した採用範囲と、Teams・予定表・Azure DevOps に対する管理者同意を示します。**Agents → All agents → Registry** でデモ用インスタンスと所有者を確認します。元データを読むのは、このインスタンスのエージェントユーザーです。
 
 2. **PM 役が Teams で報告を依頼します。** 「顧客ポータル｜リリース準備」チャットで、下記の ID を事前に控えた実 ID に置き換えて送ります。共有クエリを使う場合は、3 件の ID の代わりにクエリ名を指定します。
@@ -199,9 +309,11 @@ flowchart LR
 | 環境変数 | 既定値 | 内容 |
 | --- | --- | --- |
 | `PMO_FOUNDRY_PROJECT_ENDPOINT` | 必須（Azure ではプラットフォームの `FOUNDRY_PROJECT_ENDPOINT` を使用） | Foundry プロジェクトのエンドポイント |
-| `PMO_ANTHROPIC_MODEL` | 必須 | Claude のデプロイ名 |
+| `PMO_PROVIDER` | `claude` | `claude` または `gpt`。どちらもグループ型 Autopilot |
+| `PMO_ANTHROPIC_MODEL` | Claude のとき必須 | Claude のデプロイ名 |
+| `PMO_GPT_MODEL` | GPT のとき必須 | GPT のデプロイ名。カタログのモデル名とは別 |
 | `PMO_ADO_ORGANIZATION` | 必須 | Azure DevOps 組織名 |
-| `PMO_ADO_PROJECT` | なし | 任意のプロジェクト制限 |
+| `PMO_ADO_PROJECT` | なし（指定を推奨） | Azure DevOps の正確なプロジェクト名。モデルに伝え、ツール入力の `project` もこの名前に制限する。`create --ado-project` で設定 |
 | `PMO_STORAGE_ACCOUNT_NAME` | Azure では必須 | 会話の状態を保存する Storage アカウント |
 | `PMO_RUNTIME_CLIENT_ID` | `create` が設定 | モデルと Blob に使う既定インスタンスの client ID |
 | `PMO_M365_SERVERS` | Teams・予定表 | Microsoft 365 系 MCP サーバー（JSON）。Work IQ MCP（統合版）は `workiq.svc.cloud.microsoft` で追加可能 |
@@ -232,11 +344,12 @@ PMO_TEST_STORAGE_CONNECTION='DefaultEndpointsProtocol=http;AccountName=pmolocal;
 
 エージェントユーザーのトークンは、Autopilot インスタンスへの実際の Activity でしか取得できません。
 そのため、ローカルや Agents Playground では Azure DevOps・Microsoft 365 に接続できず、接続エラーを返します。
-テストでは、Claude・MCP・トークン取得をテストダブルに置き換えています。
+テストでは Claude SDK のイベント、GPT の HTTP 応答、MCP セッション、トークン取得を模擬します。実際の推論やテナントの権限は検証しません。
 
 ## 制約・未検証事項
 
-- Frontier 環境での作成・公開・承認・採用、エージェントユーザーのトークン取得、実際の MCP 呼び出しは検証していません。
+- GPT 版は、Frontier 環境での作成・公開・承認・採用と、Teams のチャネルからの依頼・差戻し・承認までを確認済みです（Azure DevOps、Teams チャネル、予定表の読み取りを含む）。Claude 版とグループチャットからの依頼は、実環境では未検証です。
+- Teams・予定表の MCP の実際のツール名（`ListChannelMessages` など）は、Microsoft Learn の記載（`mcp_graph_chat_…` など）と異なります。既定の許可リストは実際の名前に合わせています。プレビュー中は名前が変わる可能性があるため、ログの `mcp_tools server=… offered=` で確認してください。
 - Teams・予定表の MCP（アプリ別）は、Copilot Studio のドキュメントで「後方互換用」と記載されています。
   公式 Autopilot サンプルでは使われていますが、将来の変更に備えて、Work IQ MCP（統合版）への切り替えを設定で可能にしています。
   ただし、統合版が Autopilot のトークンに対応するかは確認できていません。
@@ -250,7 +363,7 @@ PMO_TEST_STORAGE_CONNECTION='DefaultEndpointsProtocol=http;AccountName=pmolocal;
 
 | ファイル | 内容 |
 | --- | --- |
-| [src/pmoagent/host.py](src/pmoagent/host.py) | Activity 受信、JWT 検証、エージェントユーザーのトークン取得、メンション処理 |
+| [src/pmoagent/host.py](src/pmoagent/host.py) | Activity 受信（Foundry 上では入口で認証済み、ローカルでは JWT 検証）、エージェントユーザーのトークン取得、メンション処理 |
 | [src/pmoagent/bot.py](src/pmoagent/bot.py) | 依頼・承認・差戻しの処理、依頼者の照合 |
 | [src/pmoagent/agent.py](src/pmoagent/agent.py) | Claude の実行、ツール制御、根拠の検証 |
 | [src/pmoagent/store.py](src/pmoagent/store.py) | 会話の状態の Blob 保存（ETag による競合検出） |

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pmoagent"
 version = "0.1.0"
-description = "Teams PMO assistant powered by Claude Agent SDK on Foundry"
+description = "Teams PMO Autopilot powered by Claude or GPT on Foundry"
 requires-python = ">=3.12"
 dependencies = [
   "pydantic-settings>=2.7,<3",
@@ -17,6 +17,9 @@ dependencies = [
   "microsoft-agents-hosting-aiohttp==1.9.0",
   "microsoft-agents-authentication-msal==1.9.0",
   "claude-agent-sdk==0.2.182",
+  "openai>=2,<3",
+  "mcp>=2.3,<3",
+  "httpx2>=2.10,<3",
   "opentelemetry-api>=1.30,<2",
 ]
 

@@ -26,10 +26,12 @@ def dry_run(capsys, *args: str) -> tuple[str, list[dict]]:
     return out, bodies
 
 
-def test_create_dry_run_builds_activity_autopilot_agent(capsys):
+@pytest.mark.parametrize("provider", ["claude", "gpt"])
+def test_create_dry_run_builds_activity_autopilot_agent(capsys, provider):
     out, (version, patch_body) = dry_run(
         capsys, "create", "--project-endpoint", ENDPOINT, "--image", "x.azurecr.io/pmo:1",
-        "--model", "claude", "--ado-organization", "contoso", "--storage-account", "pmostore",
+        "--model", "pmo-model", "--ado-organization", "contoso", "--storage-account", "pmostore",
+        *(["--provider", provider] if provider == "gpt" else []),
     )  # fmt: skip
     assert f"POST {ENDPOINT}/agents/pmo-agent/versions?api-version=2025-11-15-preview" in out
     definition = version["definition"]
@@ -38,6 +40,8 @@ def test_create_dry_run_builds_activity_autopilot_agent(capsys):
     ]
     assert version["digital_worker_type"] == "m365"
     env = definition["environment_variables"]
+    assert env["PMO_PROVIDER"] == provider
+    assert env["PMO_GPT_MODEL" if provider == "gpt" else "PMO_ANTHROPIC_MODEL"] == "pmo-model"
     assert env["PMO_ENVIRONMENT"] == "azure" and env["PMO_STORAGE_ACCOUNT_NAME"] == "pmostore"
     assert env["OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"] == "false"
     assert not any("SECRET" in key or "KEY" in key for key in env)

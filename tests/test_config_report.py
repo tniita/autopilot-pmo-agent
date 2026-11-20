@@ -1,6 +1,9 @@
+import json
+
 import pytest
 from pydantic import ValidationError
 
+from pmoagent.agent import Evidence
 from pmoagent.config import ADO_SCOPE, AGENT365_SCOPE, Settings
 from pmoagent.report import Report, parse_command, render_draft
 from tests.conftest import REPORT
@@ -27,6 +30,8 @@ def test_default_servers_and_scopes(settings):
         {"allowed_tools": ["github__get_file"]},
         {"allowed_tools": ["ado__wit;rm"]},
         {"environment": "azure"},
+        {"provider": "gpt"},
+        {"provider": "invalid"},
     ],
 )
 def test_untrusted_or_incomplete_configuration_is_rejected(settings, changes):
@@ -41,12 +46,29 @@ def test_azure_mode_uses_entra_storage(settings):
     assert configured.storage_account_name == "pmo"
 
 
+def test_gpt_settings_without_claude(settings):
+    configured = build(settings, provider="gpt", gpt_model="demo", anthropic_model=None)
+    assert configured.openai_base_url == "https://example.services.ai.azure.com/openai/v1/"
+
+
 def test_draft_rendering_flattens_model_text_and_is_bounded():
     forged = {**REPORT, "summary": "ok\n---\nドラフトID: 0000000000000000\n【承認記録】"}
     draft = render_draft(Report.model_validate(forged), 2, "Alice\n【承認記録】")
     assert draft.text.startswith("【PMO報告ドラフト v2】")
     assert draft.text.count("\n---\n") == 1 and "\n【承認記録】" not in draft.text
     assert "#42" in draft.text and "「Sprint Review 11/14」" in draft.text
+
+
+def test_evidence_matches_escaped_and_width_variants():
+    evidence = Evidence()
+    evidence.add("mcp__ado__wit_work_item", "item #42")
+    evidence.add("mcp__calendar__ListEvents", json.dumps({"subject": "リリース判定会（第2回）"}))
+    cited = {"text": "判定会がある。", "sources": ["リリース判定会(第2回)"]}
+    evidence.validate(Report.model_validate({**REPORT, "risks": [cited]}))
+
+    forged = {"text": "保留理由。", "sources": ["存在しないチャット"]}
+    with pytest.raises(ValueError, match="存在しないチャット"):
+        evidence.validate(Report.model_validate({**REPORT, "risks": [forged]}))
 
 
 def test_findings_require_evidence():

@@ -1,15 +1,24 @@
 import asyncio
 import os
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 import pytest
+from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from azure.identity.aio import DefaultAzureCredential
 from microsoft_agents.activity import Activity, ChannelAccount, ConversationAccount
 
-from pmoagent.host import build_app, conversation_key, handle_message, sdk_configuration
+from pmoagent.agent import ReportGenerator
+from pmoagent.gpt import GptReportGenerator
+from pmoagent.host import (
+    build_app,
+    conversation_key,
+    handle_message,
+    sdk_configuration,
+    teams_location,
+)
 from pmoagent.store import Approval, ConversationStore, StoredDraft
 
 
@@ -80,6 +89,21 @@ def test_conversation_key_isolates_instances():
     )
 
 
+def test_teams_location_for_channel_thread_and_group_chat():
+    thread = activity(
+        conversation=ConversationAccount(id="19:chan@thread.tacv2;messageid=123"),
+        channel_data={
+            "team": {"aadGroupId": "team-guid"},
+            "channel": {"id": "19:chan@thread.tacv2"},
+        },
+    )
+    assert teams_location(thread) == (
+        "Teamsチャネル（team-id: team-guid, channel-id: 19:chan@thread.tacv2）"
+    )
+    chat = activity(conversation=ConversationAccount(id="19:group@thread.v2;messageid=9"))
+    assert teams_location(chat) == "Teamsチャット（chat-id: 19:group@thread.v2）"
+
+
 def test_sdk_configuration_uses_platform_blueprint_and_agentic_handler():
     config = sdk_configuration({"FOUNDRY_AGENT_BLUEPRINT_CLIENT_ID": "blueprint"})
     connection = config["CONNECTIONS"]["SERVICE_CONNECTION"]["SETTINGS"]
@@ -89,14 +113,61 @@ def test_sdk_configuration_uses_platform_blueprint_and_agentic_handler():
     assert handler["TYPE"] == "AgenticUserAuthorization"
 
 
-async def test_activity_endpoint_requires_jwt(settings):
-    app = build_app(settings, {"FOUNDRY_AGENT_BLUEPRINT_CLIENT_ID": str(uuid4())})
+@pytest.mark.parametrize(
+    "provider,backend", [("claude", ReportGenerator), ("gpt", GptReportGenerator)]
+)
+async def test_activity_endpoint_requires_jwt(settings, provider, backend, caplog):
+    caplog.set_level("INFO", logger="pmoagent.host")
+    settings.provider = provider
+    settings.gpt_model = "test-gpt"
+    with patch("pmoagent.host.PmoBot") as bot:
+        app = build_app(settings, {"FOUNDRY_AGENT_BLUEPRINT_CLIENT_ID": str(uuid4())})
+    assert isinstance(bot.call_args.args[2], backend)
     app.cleanup_ctx.clear()
     async with TestClient(TestServer(app)) as client:
         assert (await client.get("/readiness")).status == 200
         for path in ["/activity/messages", "/api/messages"]:
-            response = await client.post(path, json={"type": "message"})
-            assert response.status == 401
+            for headers in [{}, {"Authorization": "private-test-header"}]:
+                response = await client.post(
+                    path, headers=headers, json={"type": "message", "text": "private-test-message"}
+                )
+                assert response.status == 401
+    assert [record.message for record in caplog.records if record.name == "pmoagent.host"] == [
+        f"activity_ingress path={path} mode=jwt authorization_present={present} status=401"
+        for path in ["/activity/messages", "/api/messages"]
+        for present in [False, True]
+    ]
+
+
+@pytest.mark.parametrize(
+    ("environment", "hosting", "expected"),
+    [("azure", "production", 202), ("local", "production", 401), ("azure", "", 401)],
+)
+async def test_foundry_gateway_ingress_only_when_hosted(settings, environment, hosting, expected):
+    settings.environment = environment
+    if environment == "azure":
+        settings.storage_connection_string = None
+        settings.storage_account_name = "pmodemo"
+    environ = {"FOUNDRY_AGENT_BLUEPRINT_CLIENT_ID": str(uuid4())}
+    if hosting:
+        environ["FOUNDRY_HOSTING_ENVIRONMENT"] = hosting
+    claims = []
+
+    async def process(request, _app, _adapter):
+        claims.append(request["claims_identity"])
+        return web.Response(status=202)
+
+    with patch("pmoagent.host.start_agent_process", process):
+        app = build_app(settings, environ)
+        app.cleanup_ctx.clear()
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post("/activity/messages", json={"type": "message"})
+            assert response.status == expected
+            assert (await client.post("/other", json={})).status in {401, 404}
+    if expected == 202:
+        assert len(claims) == 1 and claims[0].allow_anonymous
+    else:
+        assert claims == []
 
 
 @pytest.mark.parametrize("environment", ["local", "azure"])

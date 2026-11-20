@@ -33,17 +33,17 @@ DEFAULT_ALLOWED_TOOLS = [
     "ado__wit_work_item",
     "ado__wit_query",
     "ado__wit_backlog",
-    "teams__mcp_graph_chat_getChat",
-    "teams__mcp_graph_chat_getChatMessage",
-    "teams__mcp_graph_chat_listChatMessages",
-    "teams__mcp_graph_chat_listChats",
-    "teams__mcp_graph_teams_getChannel",
-    "teams__mcp_graph_teams_getTeam",
-    "teams__mcp_graph_teams_listChannelMessages",
-    "teams__mcp_graph_teams_listChannels",
-    "calendar__mcp_CalendarTools_graph_getEvent",
-    "calendar__mcp_CalendarTools_graph_listCalendarView",
-    "calendar__mcp_CalendarTools_graph_listEvents",
+    "teams__GetChat",
+    "teams__GetChatMessage",
+    "teams__ListChatMessages",
+    "teams__ListChats",
+    "teams__GetChannel",
+    "teams__GetTeam",
+    "teams__ListChannelMessages",
+    "teams__ListChannelMessageReplies",
+    "teams__ListChannels",
+    "calendar__ListCalendarView",
+    "calendar__ListEvents",
 ]
 
 
@@ -58,7 +58,9 @@ class Settings(BaseSettings):
             "foundry_project_endpoint", "PMO_FOUNDRY_PROJECT_ENDPOINT", "FOUNDRY_PROJECT_ENDPOINT"
         )
     )
-    anthropic_model: str = Field(min_length=1)
+    provider: Literal["claude", "gpt"] = "claude"
+    anthropic_model: str | None = Field(default=None, min_length=1)
+    gpt_model: str | None = Field(default=None, min_length=1)
     ado_organization: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9-]{0,49}$")
     # Optional extra guard. The real boundary is the agent user's Azure DevOps access.
     ado_project: str | None = Field(default=None, min_length=1, max_length=128)
@@ -98,6 +100,8 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_settings(self) -> "Settings":
+        if not (self.gpt_model if self.provider == "gpt" else self.anthropic_model):
+            raise ValueError(f"Missing model deployment name for {self.provider}")
         endpoint = urlparse(self.foundry_project_endpoint)
         if (
             endpoint.scheme != "https"
@@ -134,3 +138,7 @@ class Settings(BaseSettings):
     @property
     def anthropic_base_url(self) -> str:
         return f"https://{urlparse(self.foundry_project_endpoint).hostname}/anthropic"
+
+    @property
+    def openai_base_url(self) -> str:
+        return f"https://{urlparse(self.foundry_project_endpoint).hostname}/openai/v1/"

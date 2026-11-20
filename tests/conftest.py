@@ -61,7 +61,7 @@ def fake_query(
         yield AssistantMessage(
             content=[
                 ToolUseBlock(id="t1", name="mcp__ado__wit_work_item", input={}),
-                ToolUseBlock(id="t2", name="mcp__teams__mcp_graph_chat_listChatMessages", input={}),
+                ToolUseBlock(id="t2", name="mcp__teams__ListChatMessages", input={}),
             ],
             model="test-claude",
         )

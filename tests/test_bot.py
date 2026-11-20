@@ -59,6 +59,16 @@ async def test_revision_is_requester_only_and_keeps_original_request(settings):
     assert [d.version for d in drafts] == [1, 2] and drafts[1].requester_id == "alice-id"
 
 
+async def test_generation_gets_time_and_location_but_stores_original_request(settings):
+    calls: list[dict[str, Any]] = []
+    bot, store = make_bot(settings, calls)
+    where = "Teamsチャット（chat-id: 19:group@thread.v2）"
+    await bot.respond("進捗をまとめて", "alice-id", "Alice", KEY, tokens, location=where)
+    prompt = calls[-1]["prompt"]
+    assert where in prompt and "現在日時: 20" in prompt and "+09:00" in prompt
+    assert store.states[KEY].drafts[-1].instruction == "進捗をまとめて"
+
+
 async def test_conversations_are_isolated(settings):
     bot, _ = make_bot(settings)
     await say(bot, "今週の報告")

@@ -1,11 +1,13 @@
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 from opentelemetry import trace
 
 from pmoagent.agent import ReportGenerator, ToolAccessError
 from pmoagent.config import Settings
+from pmoagent.gpt import GptReportGenerator
 from pmoagent.report import Report, approval_record, parse_command, render_draft
 from pmoagent.store import Approval, ConversationState, ConversationStore, StoredDraft
 
@@ -20,7 +22,12 @@ class WorkflowRejection(Exception):
 
 
 class PmoBot:
-    def __init__(self, settings: Settings, store: ConversationStore, generator: ReportGenerator):
+    def __init__(
+        self,
+        settings: Settings,
+        store: ConversationStore,
+        generator: ReportGenerator | GptReportGenerator,
+    ):
         self.settings = settings
         self.store = store
         self.generator = generator
@@ -32,6 +39,7 @@ class PmoBot:
         sender_name: str,
         conversation_key: str,
         tokens: TokenProvider,
+        location: str = "",
     ) -> str:
         command = parse_command(text)
         if not command.text and command.kind == "request":
@@ -46,9 +54,11 @@ class PmoBot:
                     return NO_DRAFT
                 if latest.requester_id != sender_id:
                     return f"差戻しできるのは依頼者（{latest.requester_name}）だけです。"
-                report = await self._generate(latest.instruction, command.text, latest.body, tokens)
+                report = await self._generate(
+                    latest.instruction, command.text, latest.body, tokens, location
+                )
                 return await self._save(conversation_key, report, latest.instruction, latest)
-            report = await self._generate(command.text, "", "", tokens)
+            report = await self._generate(command.text, "", "", tokens, location)
             requester = StoredDraft(
                 version=0,
                 draft_id="",
@@ -74,7 +84,12 @@ class PmoBot:
             return "根拠を確認できる報告を作成できませんでした。依頼内容を具体的にして再度お試しください。"
 
     async def _generate(
-        self, instruction: str, feedback: str, previous: str, tokens: TokenProvider
+        self,
+        instruction: str,
+        feedback: str,
+        previous: str,
+        tokens: TokenProvider,
+        location: str = "",
     ) -> Report:
         acquired: dict[str, str] = {}
         for server in self.settings.servers:
@@ -82,7 +97,11 @@ class PmoBot:
                 acquired[server.label] = await tokens(server.scope)
             except Exception as error:
                 raise ToolAccessError(f"Token acquisition failed for {server.label}") from error
-        return await self.generator.generate(instruction, feedback, previous, acquired)
+        now = datetime.now(ZoneInfo("Asia/Tokyo")).isoformat(timespec="minutes")
+        context = f"\n\n（実行時の情報）現在日時: {now}"
+        if location:
+            context += f"。この依頼を受けた場所: {location}。会話を参照するときはこの場所を使います"
+        return await self.generator.generate(instruction + context, feedback, previous, acquired)
 
     async def _save(
         self, key: str, report: Report, instruction: str, requester: StoredDraft

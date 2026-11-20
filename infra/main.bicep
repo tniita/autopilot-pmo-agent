@@ -1,14 +1,15 @@
 targetScope = 'resourceGroup'
 
 param location string = resourceGroup().location
-@minLength(1)
-param organizationName string
-@minLength(2)
+param deployModel bool = true
+@allowed(['Anthropic', 'OpenAI'])
+param modelFormat string = 'Anthropic'
+param organizationName string = ''
 @maxLength(2)
-param countryCode string
-@minLength(1)
-param industry string
+param countryCode string = ''
+param industry string = ''
 param modelName string
+param deploymentName string = modelName
 param modelVersion string
 @minValue(1)
 param modelCapacity int = 1
@@ -37,24 +38,26 @@ resource project 'Microsoft.CognitiveServices/accounts/projects@2025-10-01-previ
   properties: {}
 }
 
-resource model 'Microsoft.CognitiveServices/accounts/deployments@2025-10-01-preview' = {
+resource model 'Microsoft.CognitiveServices/accounts/deployments@2025-10-01-preview' = if (deployModel) {
   parent: foundry
-  name: modelName
+  name: deploymentName
   sku: {
     name: 'GlobalStandard'
     capacity: modelCapacity
   }
   properties: {
     model: {
-      format: 'Anthropic'
+      format: modelFormat
       name: modelName
       version: modelVersion
     }
-    modelProviderData: {
-      organizationName: organizationName
-      countryCode: countryCode
-      industry: industry
-    }
+    ...(modelFormat == 'Anthropic' ? {
+      modelProviderData: {
+        organizationName: organizationName
+        countryCode: countryCode
+        industry: industry
+      }
+    } : {})
   }
   dependsOn: [project]
 }
@@ -105,7 +108,7 @@ resource conversations 'Microsoft.Storage/storageAccounts/blobServices/container
 
 output projectEndpoint string = 'https://${foundry.name}.services.ai.azure.com/api/projects/${project.name}'
 output projectResourceId string = project.id
-output modelDeploymentName string = model.name
+output modelDeploymentName string = deployModel ? deploymentName : ''
 output acrName string = registry.name
 output image string = '${registry.properties.loginServer}/pmo-agent:1'
 output storageAccountName string = storage.name
