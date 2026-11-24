@@ -21,6 +21,12 @@ class WorkflowRejection(Exception):
     """A user-visible refusal decided while updating state."""
 
 
+def _mark_failed(error: Exception) -> None:
+    span = trace.get_current_span()
+    span.record_exception(error)
+    span.set_status(trace.StatusCode.ERROR, type(error).__name__)
+
+
 class PmoBot:
     def __init__(
         self,
@@ -70,16 +76,19 @@ class PmoBot:
             return await self._save(conversation_key, report, command.text, requester)
         except WorkflowRejection as rejection:
             return str(rejection)
-        except ToolAccessError:
+        except ToolAccessError as error:
+            _mark_failed(error)
             logger.exception("Data source unavailable")
             return (
                 "Azure DevOps／Microsoft 365に接続できませんでした。"
                 "エージェントのアカウントの権限と管理者の同意を確認してください。"
             )
-        except TimeoutError:
+        except TimeoutError as error:
+            _mark_failed(error)
             logger.exception("Report generation timed out")
             return "報告の作成がタイムアウトしました。対象を絞って再度依頼してください。"
-        except Exception:
+        except Exception as error:
+            _mark_failed(error)
             logger.exception("Request failed")
             return "根拠を確認できる報告を作成できませんでした。依頼内容を具体的にして再度お試しください。"
 

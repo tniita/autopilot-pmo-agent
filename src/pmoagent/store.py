@@ -97,8 +97,12 @@ class ConversationStore:
         return hashlib.sha256(key.encode()).hexdigest() + ".json"
 
     async def load(self, key: str) -> tuple[ConversationState, str | None]:
+        blob = self.container.get_blob_client(self._name(key))
+        # exists() avoids recording an expected 404 for new conversations as a failed span.
+        if not await blob.exists():
+            return ConversationState(), None
         try:
-            download = await self.container.download_blob(self._name(key))
+            download = await blob.download_blob()
         except ResourceNotFoundError:
             return ConversationState(), None
         state = ConversationState.model_validate_json(await download.readall())

@@ -15,6 +15,8 @@ from pmoagent.gpt import GptReportGenerator
 from pmoagent.host import (
     build_app,
     conversation_key,
+    deferrer,
+    expected_http_response,
     handle_message,
     sdk_configuration,
     teams_location,
@@ -62,6 +64,88 @@ async def test_message_strips_mention_and_uses_verified_sender(settings):
     assert (text, sender_id, sender_name) == ("承認", "alice-id", "Alice")
     assert key == "inst:tid:19:group"
     assert sent[-1] == "ok"
+
+
+async def test_gateway_reply_is_deferred_with_prefetched_tokens(settings):
+    seen = []
+
+    async def respond(text, sender_id, sender_name, key, tokens, location=""):
+        seen.append(await tokens(settings.servers[0].scope))
+        return "draft"
+
+    bot = SimpleNamespace(respond=respond)
+    context, sent = context_for(activity(text="<at>PMO</at> 今週の進捗"))
+    later = []
+    exchange = AsyncMock(return_value="token")
+    await handle_message(context, settings, bot, exchange, lambda _ctx, work: later.append(work))
+    assert not seen and len(later) == 1
+    assert exchange.await_count == len({s.scope for s in settings.servers})
+
+    turn, posted = context_for(context.activity)
+    await later[0](turn)
+    assert seen == ["token"] and posted[-1] == "draft"
+
+
+async def test_deferred_approval_skips_tokens_and_failures_surface_later(settings):
+    bot = SimpleNamespace(respond=AsyncMock(return_value="ok"))
+    context, _ = context_for(activity())
+    exchange = AsyncMock(side_effect=RuntimeError("denied"))
+    await handle_message(context, settings, bot, exchange, lambda _ctx, _work: None)
+    exchange.assert_not_awaited()
+
+    context, _ = context_for(activity(text="<at>PMO</at> 進捗"))
+    later = []
+    await handle_message(context, settings, bot, exchange, lambda _ctx, work: later.append(work))
+    turn, _ = context_for(context.activity)
+    await later[0](turn)
+    tokens = bot.respond.call_args.args[4]
+    with pytest.raises(RuntimeError, match="denied"):
+        await tokens(settings.servers[0].scope)
+
+
+async def test_deferred_reply_continues_inbound_trace(spans):
+    from opentelemetry import trace
+
+    turns = []
+
+    async def continue_conversation(_identity, continuation, work, audience):
+        await work(SimpleNamespace(activity=continuation))
+
+    adapter = SimpleNamespace(continue_conversation_with_claims=continue_conversation)
+    background = set()
+    defer = deferrer(adapter, background)
+    context = SimpleNamespace(activity=activity(), identity=None)
+
+    async def work(turn):
+        turns.append(turn.activity.id)
+
+    with trace.get_tracer("test").start_as_current_span("POST /activity/messages") as inbound:
+        defer(context, work)
+    await asyncio.gather(*background)
+
+    reply = next(s for s in spans.get_finished_spans() if s.name == "pmo.reply")
+    assert turns == ["m1"]
+    assert reply.parent.span_id == inbound.get_span_context().span_id
+    assert reply.context.trace_id == inbound.get_span_context().trace_id
+    assert reply.attributes["gen_ai.conversation.id"] == "19:group"
+
+
+async def test_only_mcp_sse_probe_405_is_treated_as_success(spans):
+    import httpx2
+    from opentelemetry.instrumentation.httpx import HTTPX2ClientInstrumentor
+    from opentelemetry.trace import StatusCode
+
+    transport = httpx2.MockTransport(lambda r: httpx2.Response(405 if r.method == "GET" else 404))
+    async with httpx2.AsyncClient(transport=transport) as client:
+        HTTPX2ClientInstrumentor().instrument_client(client, response_hook=expected_http_response)
+        await client.get("https://mcp.example/", headers={"accept": "text/event-stream"})
+        await client.get("https://mcp.example/")
+        await client.post("https://mcp.example/", headers={"accept": "text/event-stream"})
+    assert [s.status.status_code for s in spans.get_finished_spans()] == [
+        StatusCode.OK,
+        StatusCode.ERROR,
+        StatusCode.ERROR,
+    ]
 
 
 @pytest.mark.parametrize(
@@ -133,7 +217,8 @@ async def test_activity_endpoint_requires_jwt(settings, provider, backend, caplo
                 )
                 assert response.status == 401
     assert [record.message for record in caplog.records if record.name == "pmoagent.host"] == [
-        f"activity_ingress path={path} mode=jwt authorization_present={present} status=401"
+        f"activity_ingress path={path} mode=jwt authorization_present={present} "
+        "traceparent_present=False status=401"
         for path in ["/activity/messages", "/api/messages"]
         for present in [False, True]
     ]

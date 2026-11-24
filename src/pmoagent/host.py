@@ -18,20 +18,27 @@ from microsoft_agents.hosting.aiohttp import (
 )
 from microsoft_agents.hosting.core import (
     AgentApplication,
+    AuthenticationConstants,
     Authorization,
     ClaimsIdentity,
     MemoryStorage,
     TurnContext,
     TurnState,
 )
+from opentelemetry import propagate, trace
+from opentelemetry.trace import SpanKind, StatusCode
 
 from pmoagent.agent import ReportGenerator
-from pmoagent.bot import PmoBot
+from pmoagent.bot import PmoBot, TokenProvider
 from pmoagent.config import Settings
 from pmoagent.gpt import GptReportGenerator
+from pmoagent.report import parse_command
 from pmoagent.store import ConversationStore
 
 logger = logging.getLogger(__name__)
+tracer = trace.get_tracer(__name__)
+Work = Callable[[TurnContext], Awaitable[None]]
+Defer = Callable[[TurnContext, Work], None]
 PUBLIC_PATHS = {"/readiness", "/liveness"}
 ACTIVITY_PATHS = {"/activity/messages", "/api/messages"}
 MAX_INPUT_CHARS = 2000
@@ -91,11 +98,69 @@ def teams_location(activity: Activity) -> str:
     return ""
 
 
+def configure_telemetry(environ: dict[str, str]) -> bool:
+    # Foundry injects this setting into hosted containers when project monitoring is on.
+    connection_string = environ.get("APPLICATIONINSIGHTS_CONNECTION_STRING")
+    if not connection_string:
+        return False
+    from azure.monitor.opentelemetry import configure_azure_monitor
+    from opentelemetry.instrumentation.httpx import HTTPX2ClientInstrumentor
+    from opentelemetry.sdk.resources import Resource
+
+    configure_azure_monitor(
+        connection_string=connection_string,
+        logger_name="pmoagent",
+        enable_live_metrics=False,
+        resource=Resource.create({"service.name": environ.get("FOUNDRY_AGENT_NAME", "pmo-agent")}),
+        instrumentation_options={"httpx2": {"enabled": False}},
+    )
+    HTTPX2ClientInstrumentor().instrument(async_response_hook=expected_http_response)
+    return True
+
+
+async def expected_http_response(span: Any, request: Any, response: Any) -> None:
+    # MCP clients probe an optional GET SSE stream; servers without one answer 405 by spec.
+    method = request.method.decode() if isinstance(request.method, bytes) else request.method
+    accept = str(request.headers.get("accept", ""))
+    if method == "GET" and response.status_code == 405 and "text/event-stream" in accept:
+        span.set_status(StatusCode.OK)
+
+
+def activity_attributes(activity: Activity) -> dict[str, str]:
+    attributes = {"activity.id": activity.id or ""}
+    if activity.conversation and activity.conversation.id:
+        attributes["gen_ai.conversation.id"] = activity.conversation.id
+    return attributes
+
+
+async def prefetch_tokens(
+    context: TurnContext,
+    scopes: list[str],
+    exchange: Callable[[TurnContext, str], Awaitable[str]],
+) -> TokenProvider:
+    # Agentic token exchange needs the inbound turn, so tokens are acquired before it ends.
+    results: dict[str, str | Exception] = {}
+    for scope in dict.fromkeys(scopes):
+        try:
+            results[scope] = await exchange(context, scope)
+        except Exception as error:
+            results[scope] = error
+
+    async def tokens(scope: str) -> str:
+        value = results.get(scope) or RuntimeError(f"No token was prepared for {scope}")
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    return tokens
+
+
 async def handle_message(
     context: TurnContext,
     settings: Settings,
     bot: PmoBot,
     exchange: Callable[[TurnContext, str], Awaitable[str]],
+    defer: Defer | None = None,
 ) -> None:
     activity = context.activity
     sender = activity.from_property
@@ -112,33 +177,78 @@ async def handle_message(
         await context.send_activity(f"依頼は{MAX_INPUT_CHARS}文字以内で入力してください。")
         return
 
-    async def tokens(scope: str) -> str:
-        return await exchange(context, scope)
+    sender_id = sender.aad_object_id
+    sender_name = sender.name or "依頼者"
+    key = conversation_key(activity)
+    location = teams_location(activity)
 
-    async def typing() -> None:
-        while True:
-            await context.send_activity(Activity(type="typing"))
-            await asyncio.sleep(4)
+    async def reply(turn: TurnContext, tokens: TokenProvider) -> None:
+        async def typing() -> None:
+            while True:
+                await turn.send_activity(Activity(type="typing"))
+                await asyncio.sleep(4)
 
-    typing_task = asyncio.create_task(typing())
-    try:
-        reply = await bot.respond(
-            text,
-            sender.aad_object_id,
-            sender.name or "依頼者",
-            conversation_key(activity),
-            tokens,
-            location=teams_location(activity),
-        )
-    finally:
-        typing_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await typing_task
-    await context.send_activity(reply)
+        typing_task = asyncio.create_task(typing())
+        try:
+            answer = await bot.respond(text, sender_id, sender_name, key, tokens, location=location)
+        finally:
+            typing_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await typing_task
+        await turn.send_activity(answer)
+
+    if defer is None:
+
+        async def exchange_now(scope: str) -> str:
+            return await exchange(context, scope)
+
+        await reply(context, exchange_now)
+        return
+
+    command = parse_command(text)
+    scopes = [s.scope for s in settings.servers] if command.kind != "approve" else []
+    await context.send_activity(Activity(type="typing"))
+    tokens = await prefetch_tokens(context, scopes, exchange)
+
+    async def deferred(turn: TurnContext) -> None:
+        await reply(turn, tokens)
+
+    defer(context, deferred)
 
 
 def foundry_gateway_ingress(settings: Settings, environ: dict[str, str]) -> bool:
     return settings.environment == "azure" and bool(environ.get("FOUNDRY_HOSTING_ENVIRONMENT"))
+
+
+def deferrer(adapter: CloudAdapter, background: set[asyncio.Task[None]]) -> Defer:
+    def defer(context: TurnContext, work: Work) -> None:
+        # The Foundry gateway drops activity requests held for ~30s, so long work
+        # finishes in a proactive turn after the inbound request has returned 202.
+        continuation = context.activity.model_copy(deep=True)
+        identity = context.identity or ClaimsIdentity({}, authentication_type="Anonymous")
+
+        async def run() -> None:
+            # create_task copies the inbound span context, so this span joins the request trace.
+            with tracer.start_as_current_span(
+                "pmo.reply", attributes=activity_attributes(continuation)
+            ) as span:
+                try:
+                    await adapter.continue_conversation_with_claims(
+                        identity,
+                        continuation,
+                        work,
+                        audience=AuthenticationConstants.AGENTS_SDK_SCOPE,
+                    )
+                except Exception as error:
+                    span.record_exception(error)
+                    span.set_status(StatusCode.ERROR)
+                    logger.exception("Deferred reply failed")
+
+        task = asyncio.create_task(run())
+        background.add(task)
+        task.add_done_callback(background.discard)
+
+    return defer
 
 
 def build_app(settings: Settings, environ: dict[str, str] | None = None) -> web.Application:
@@ -169,9 +279,12 @@ def build_app(settings: Settings, environ: dict[str, str] | None = None) -> web.
             raise RuntimeError("Agentic user token exchange returned no token")
         return str(response.token)
 
+    background: set[asyncio.Task[None]] = set()
+    defer = deferrer(adapter, background)
+
     @agent_app.activity("message", auth_handlers=[settings.auth_handler])
     async def on_message(context: TurnContext, _state: TurnState) -> None:
-        await handle_message(context, settings, bot, exchange)
+        await handle_message(context, settings, bot, exchange, defer if gateway else None)
 
     @web.middleware
     async def authenticate(
@@ -180,21 +293,31 @@ def build_app(settings: Settings, environ: dict[str, str] | None = None) -> web.
         if request.method == "GET" and request.path in PUBLIC_PATHS:
             return await handler(request)
         is_activity = request.method == "POST" and request.path in ACTIVITY_PATHS
-        if gateway and is_activity:
-            # Foundry authenticates channel traffic at its edge and does not forward the
-            # channel JWT; mirror azure-ai-agentserver-activity's digital-worker claims.
-            request["claims_identity"] = ClaimsIdentity({}, authentication_type="Anonymous")
-            response = await handler(request)
-        else:
-            response = await jwt_authorization_middleware(request, handler)
-        if not isinstance(response, web.StreamResponse):
-            raise TypeError("Activity middleware returned an invalid response")
+        with tracer.start_as_current_span(
+            f"{request.method} {request.path if is_activity else '(other)'}",
+            context=propagate.extract(request.headers),
+            kind=SpanKind.SERVER,
+        ) as span:
+            if gateway and is_activity:
+                # Foundry authenticates channel traffic at its edge and does not forward the
+                # channel JWT; mirror azure-ai-agentserver-activity's digital-worker claims.
+                request["claims_identity"] = ClaimsIdentity({}, authentication_type="Anonymous")
+                response = await handler(request)
+            else:
+                response = await jwt_authorization_middleware(request, handler)
+            if not isinstance(response, web.StreamResponse):
+                raise TypeError("Activity middleware returned an invalid response")
+            span.set_attribute("http.response.status_code", response.status)
+            if response.status >= 500:
+                span.set_status(StatusCode.ERROR)
         if is_activity:
             logger.info(
-                "activity_ingress path=%s mode=%s authorization_present=%s status=%d",
+                "activity_ingress path=%s mode=%s authorization_present=%s "
+                "traceparent_present=%s status=%d",
                 request.path,
                 "foundry" if gateway else "jwt",
                 "Authorization" in request.headers,
+                "traceparent" in request.headers,
                 response.status,
             )
         return response
@@ -217,6 +340,8 @@ def build_app(settings: Settings, environ: dict[str, str] | None = None) -> web.
                 await store.initialize()
             yield
         finally:
+            if background:
+                await asyncio.wait(background, timeout=settings.generation_timeout)
             await store.close()
             await credential.close()
 
@@ -234,4 +359,6 @@ def main() -> None:
     for name in ("azure", "httpx", "httpcore", "msal"):
         logging.getLogger(name).setLevel(logging.WARNING)
     settings = Settings()  # type: ignore[call-arg]
+    if configure_telemetry(dict(os.environ)):
+        logger.info("telemetry exporter=azure_monitor")
     web.run_app(build_app(settings), host="0.0.0.0", port=int(os.environ.get("PORT", "8088")))

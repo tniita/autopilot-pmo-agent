@@ -12,9 +12,15 @@ from claude_agent_sdk import (
     ToolUseBlock,
     UserMessage,
 )
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from pmoagent.config import Settings
 from pmoagent.store import ConversationState
+
+_SPANS = InMemorySpanExporter()
 
 AZURITE = (
     "DefaultEndpointsProtocol=http;AccountName=pmolocal;"
@@ -41,6 +47,17 @@ def settings() -> Settings:
         ado_organization="contoso",
         storage_connection_string=os.getenv("PMO_TEST_STORAGE_CONNECTION", AZURITE),
     )
+
+
+@pytest.fixture
+def spans() -> InMemorySpanExporter:
+    # The global tracer provider can be set only once per process.
+    if not isinstance(trace.get_tracer_provider(), TracerProvider):
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(_SPANS))
+        trace.set_tracer_provider(provider)
+    _SPANS.clear()
+    return _SPANS
 
 
 def fake_query(

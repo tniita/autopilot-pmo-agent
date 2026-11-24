@@ -101,7 +101,8 @@ class GptReportGenerator:
         ]
         allowed = {"mcp__" + name for name in settings.allowed_tools}
         evidence = Evidence()
-        with trace.get_tracer(__name__).start_as_current_span("pmo.generate"):
+        tracer = trace.get_tracer(__name__)
+        with tracer.start_as_current_span("pmo.generate"):
             async with (
                 asyncio.timeout(settings.generation_timeout),
                 AsyncOpenAI(
@@ -119,14 +120,29 @@ class GptReportGenerator:
                     corrections = 2
                     for _ in range(settings.max_turns):
                         # Reasoning models reject function tools on Chat Completions.
-                        reply = await model.responses.create(
-                            model=settings.gpt_model,
-                            input=messages,
-                            tools=[tool.definition for tool in tools.values()],
-                            text={"format": {"type": "json_object"}},
-                            store=False,
-                            include=["reasoning.encrypted_content"],
-                        )
+                        with tracer.start_as_current_span(
+                            f"chat {settings.gpt_model}",
+                            kind=trace.SpanKind.CLIENT,
+                            attributes={
+                                "gen_ai.operation.name": "chat",
+                                "gen_ai.request.model": settings.gpt_model,
+                            },
+                        ) as span:
+                            reply = await model.responses.create(
+                                model=settings.gpt_model,
+                                input=messages,
+                                tools=[tool.definition for tool in tools.values()],
+                                text={"format": {"type": "json_object"}},
+                                store=False,
+                                include=["reasoning.encrypted_content"],
+                            )
+                            if reply.usage:
+                                span.set_attribute(
+                                    "gen_ai.usage.input_tokens", reply.usage.input_tokens
+                                )
+                                span.set_attribute(
+                                    "gen_ai.usage.output_tokens", reply.usage.output_tokens
+                                )
                         calls = [item for item in reply.output if item.type == "function_call"]
                         if not calls:
                             if reply.status != "completed" or not reply.output_text:
@@ -165,11 +181,21 @@ class GptReportGenerator:
                                 name, arguments, allowed, settings.ado_project
                             ):
                                 raise ToolAccessError("GPT tool arguments or project not allowed")
-                            result = await bound.session.call_tool(
-                                bound.name.split("__", 1)[1], arguments
-                            )
-                            if not isinstance(result, types.CallToolResult):
-                                raise ToolAccessError("MCP tool did not succeed")
+                            with tracer.start_as_current_span(
+                                f"execute_tool {bound.name}",
+                                kind=trace.SpanKind.CLIENT,
+                                attributes={
+                                    "gen_ai.operation.name": "execute_tool",
+                                    "gen_ai.tool.name": bound.name,
+                                },
+                            ) as span:
+                                result = await bound.session.call_tool(
+                                    bound.name.split("__", 1)[1], arguments
+                                )
+                                if not isinstance(result, types.CallToolResult):
+                                    raise ToolAccessError("MCP tool did not succeed")
+                                if result.is_error:
+                                    span.set_status(trace.StatusCode.ERROR)
                             logger.info("mcp_call tool=%s error=%s", bound.name, result.is_error)
                             text = "\n".join(
                                 block.text

@@ -61,6 +61,7 @@ flowchart LR
   ただし、**本当の境界はエージェントユーザーアカウントの権限です。**
 - `PMO_ADO_PROJECT` を設定すると、ツール入力の `project` も確認します（補助的なガード）。
 - トレースへのメッセージ本文の記録は無効です（`OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=false`）。
+  Foundry が注入する `APPLICATIONINSIGHTS_CONNECTION_STRING` があるとき、コンテナーの span（受信・`pmo.reply`・`pmo.generate`・モデル呼び出し・MCP ツール呼び出し）とログを Application Insights に送ります。記録するのはツール名・モデル名・トークン数などで、本文やツール引数は送りません。
 
 ## 前提条件
 
@@ -260,6 +261,7 @@ az tag update --resource-id "$(out storageAccountId)" --operation Delete --tags 
 | 「接続できませんでした」。ログに `AADSTS65001` | Azure DevOps MCP の同意がない | 上記 1・2 |
 | Azure DevOps の結果が `TF200016` | プロジェクト名の誤り | `--ado-project` に正確な名前を指定 |
 | 「Teams・予定表を参照できません」。ログの `mcp_tools enabled=` に Teams・予定表がない | 許可リストと実際のツール名が不一致 | `mcp_tools server=… offered=` の名前で `PMO_ALLOWED_TOOLS` を見直す |
+| 返信は届くが、トレースに `agents.error`（`ActivityProtocolRequestFailed` / `HttpRequestException`）| 応答を返さないまま約 30 秒が経ち、ゲートウェイが接続を切った（返信を遅らせる処理を入れる前のイメージ） | 最新イメージで新しいバージョンを作成。ログの `Deferred reply failed` も確認 |
 | 「根拠を確認できる報告を作成できませんでした」 | 報告の根拠がツールの結果と一致しない | ログの `report_rejected reason=` を確認 |
 
 ## デモの事前準備：顧客ポータルのリリース判定
@@ -353,8 +355,9 @@ PMO_TEST_STORAGE_CONNECTION='DefaultEndpointsProtocol=http;AccountName=pmolocal;
 - Teams・予定表の MCP（アプリ別）は、Copilot Studio のドキュメントで「後方互換用」と記載されています。
   公式 Autopilot サンプルでは使われていますが、将来の変更に備えて、Work IQ MCP（統合版）への切り替えを設定で可能にしています。
   ただし、統合版が Autopilot のトークンに対応するかは確認できていません。
-- 生成は Teams の Activity 処理の中で同期的に行います（入力中表示を継続）。
-  長時間の生成で Teams 側がタイムアウトしないかは、実環境で確認が必要です。
+- Foundry 上では、依頼を受けたターンで MCP 用トークンだけを取得してすぐ 202 を返し、生成と投稿は会話を継続する別ターン（プロアクティブ送信）で行います。
+  Foundry ゲートウェイは約 30 秒で Activity の HTTP 接続を切り、トレースに `ActivityProtocolRequestFailed` を記録するためです。ローカルでは従来どおり同期的に処理します。
+  後続の処理は受信リクエストのトレースを引き継いだ `pmo.reply` span として記録するため、`invoke_agent` が先に終わっても投稿までを同じトレースで追えます（ゲートウェイが `traceparent` を渡さない場合は別トレースになり、`gen_ai.conversation.id` で突き合わせます。ログの `traceparent_present=` で確認できます）。
 - 承認記録は Blob とトレースに保存します。改ざん防止された監査記録ではありません。保持期間・アクセス権・バックアップは運用で定めてください。
 - 報告の正確性は保証されません。根拠の ID・参照元の存在は確認しますが、記述内容が正しいかは人が確認してください。
 - 自動投稿・メール対応などの自発的な動作は対象外です。
