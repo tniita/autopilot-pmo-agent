@@ -149,6 +149,32 @@ async def test_only_mcp_sse_probe_405_is_treated_as_success(spans):
 
 
 @pytest.mark.parametrize(
+    ("conversation_type", "mentioned_id", "answered"),
+    [
+        ("channel", "28:other-agent", False),
+        ("groupChat", "28:other-agent", False),
+        ("channel", "8:orgid:PMO-USER", True),
+        ("personal", "28:other-agent", True),
+    ],
+)
+async def test_group_messages_need_our_own_mention(
+    settings, conversation_type, mentioned_id, answered
+):
+    bot = SimpleNamespace(respond=AsyncMock(return_value="ok"))
+    act = activity(
+        conversation=ConversationAccount(id="19:c", conversation_type=conversation_type),
+        recipient=ChannelAccount(
+            id="28:pmo", role="agenticUser", agentic_app_id="inst", agentic_user_id="pmo-user"
+        ),
+        entities=[{"type": "mention", "text": "<at>X</at>", "mentioned": {"id": mentioned_id}}],
+    )
+    context, sent = context_for(act)
+    await handle_message(context, settings, bot, AsyncMock(return_value="token"))
+    assert bot.respond.await_count == int(answered)
+    assert bool(sent) == answered
+
+
+@pytest.mark.parametrize(
     ("updates", "environment", "message"),
     [
         ({"from_property": ChannelAccount(id="29:x", name="X")}, "local", "送信者を確認できない"),

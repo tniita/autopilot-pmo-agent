@@ -80,6 +80,36 @@ def conversation_key(activity: Activity) -> str:
     return f"{instance}:{tenant}:{conversation.id if conversation else ''}"
 
 
+def is_group_conversation(activity: Activity) -> bool:
+    conversation = activity.conversation
+    if conversation is None:
+        return False
+    return bool(conversation.is_group) or conversation.conversation_type in {"channel", "groupChat"}
+
+
+def mentions_recipient(activity: Activity) -> bool:
+    recipient = activity.recipient
+    if recipient is None:
+        return False
+    own = {
+        value.casefold()
+        for value in (recipient.id, recipient.aad_object_id, recipient.agentic_user_id)
+        if value
+    }
+    for mention in activity.get_mentions():
+        mentioned = (mention.mentioned.id if mention.mentioned else "") or ""
+        # Teams may prefix user IDs, for example "8:orgid:<object id>".
+        candidate = mentioned.casefold()
+        if candidate in own or any(candidate.endswith(":" + value) for value in own):
+            return True
+    logger.info(
+        "message_ignored reason=not_mentioned recipient_ids=%s mentioned_ids=%s",
+        sorted(own),
+        [m.mentioned.id for m in activity.get_mentions() if m.mentioned],
+    )
+    return False
+
+
 def teams_location(activity: Activity) -> str:
     data = activity.channel_data if isinstance(activity.channel_data, dict) else {}
     team = data.get("team") or {}
@@ -168,6 +198,9 @@ async def handle_message(
         await context.send_activity(
             "このエージェントはAutopilotインスタンスとしてのみ利用できます。"
         )
+        return
+    # Agent users in a channel receive every message, so answer only our own @mention.
+    if is_group_conversation(activity) and not mentions_recipient(activity):
         return
     if sender is None or not sender.aad_object_id:
         await context.send_activity("送信者を確認できないため処理できません。")

@@ -5,7 +5,9 @@ commands without acquiring tokens or changing anything.
 """
 
 import argparse
+import copy
 import json
+import os
 import subprocess
 import sys
 import time
@@ -14,8 +16,10 @@ from urllib.parse import urlparse
 
 import httpx
 from azure.identity import AzureCliCredential
+from dotenv import dotenv_values
 
 API_VERSION = "2025-11-15-preview"
+API_KEY_VARIABLE = "PMO_ANTHROPIC_API_KEY"
 FOUNDRY_USER_ROLE = "Foundry User"
 BLOB_CONTRIBUTOR_ROLE = "Storage Blob Data Contributor"
 PERMISSION_SCOPES = [
@@ -35,6 +39,29 @@ def project_endpoint(value: str) -> str:
     return value.rstrip("/")
 
 
+def resource_endpoint(value: str) -> str:
+    parsed = urlparse(value)
+    host = parsed.hostname or ""
+    if parsed.scheme != "https" or not host.endswith(".services.ai.azure.com"):
+        raise argparse.ArgumentTypeError("Expected a Foundry resource HTTPS URL")
+    return f"https://{host}"
+
+
+def anthropic_api_key() -> str:
+    key = os.environ.get(API_KEY_VARIABLE) or dotenv_values(".env").get(API_KEY_VARIABLE)
+    if not key:
+        raise SystemExit(f"{API_KEY_VARIABLE} is not set in the environment or .env")
+    return key
+
+
+def redacted(body: dict[str, Any]) -> dict[str, Any]:
+    shown = copy.deepcopy(body)
+    env = shown.get("definition", {}).get("environment_variables", {})
+    if API_KEY_VARIABLE in env:
+        env[API_KEY_VARIABLE] = "<redacted>"
+    return shown
+
+
 def runtime_environment(args: argparse.Namespace, runtime_client_id: str | None) -> dict[str, str]:
     env = {
         "PYTHONNOUSERSITE": "1",
@@ -47,6 +74,10 @@ def runtime_environment(args: argparse.Namespace, runtime_client_id: str | None)
     }
     if args.ado_project:
         env["PMO_ADO_PROJECT"] = args.ado_project
+    if args.anthropic_endpoint:
+        env["PMO_ANTHROPIC_ENDPOINT"] = args.anthropic_endpoint
+    if args.anthropic_api_key_from_env:
+        env[API_KEY_VARIABLE] = anthropic_api_key()
     if runtime_client_id:
         env["PMO_RUNTIME_CLIENT_ID"] = runtime_client_id
     return env
@@ -119,7 +150,7 @@ class Foundry:
         if not self.apply:
             print(f"[dry-run] {method} {url}")
             if body is not None:
-                print(json.dumps(body, ensure_ascii=False, indent=2))
+                print(json.dumps(redacted(body), ensure_ascii=False, indent=2))
             return {}
         if self.client is None:
             token = AzureCliCredential().get_token("https://ai.azure.com/.default").token
@@ -228,6 +259,16 @@ def parser() -> argparse.ArgumentParser:
     create_cmd.add_argument("--ado-project")
     create_cmd.add_argument("--storage-account", required=True)
     create_cmd.add_argument("--runtime-client-id")
+    create_cmd.add_argument(
+        "--anthropic-endpoint",
+        type=resource_endpoint,
+        help="Foundry resource serving Claude, when it is not the hosting project's resource",
+    )
+    create_cmd.add_argument(
+        "--anthropic-api-key-from-env",
+        action="store_true",
+        help=f"Store {API_KEY_VARIABLE} (environment or .env) in the agent definition in plain text",
+    )
     create_cmd.set_defaults(func=create)
 
     grant_cmd = commands.add_parser("grant", parents=[common])

@@ -21,6 +21,11 @@ def test_default_servers_and_scopes(settings):
     assert settings.anthropic_base_url == "https://example.services.ai.azure.com/anthropic"
 
 
+def test_claude_can_use_another_foundry_resource(settings):
+    configured = build(settings, anthropic_endpoint="https://claude.services.ai.azure.com")
+    assert configured.anthropic_base_url == "https://claude.services.ai.azure.com/anthropic"
+
+
 @pytest.mark.parametrize(
     "changes",
     [
@@ -32,6 +37,9 @@ def test_default_servers_and_scopes(settings):
         {"environment": "azure"},
         {"provider": "gpt"},
         {"provider": "invalid"},
+        {"anthropic_api_key": ""},
+        {"anthropic_endpoint": "https://evil.example"},
+        {"anthropic_endpoint": "https://x.services.ai.azure.com/anthropic"},
     ],
 )
 def test_untrusted_or_incomplete_configuration_is_rejected(settings, changes):
@@ -69,6 +77,13 @@ def test_evidence_matches_escaped_and_width_variants():
     forged = {"text": "保留理由。", "sources": ["存在しないチャット"]}
     with pytest.raises(ValueError, match="存在しないチャット"):
         evidence.validate(Report.model_validate({**REPORT, "risks": [forged]}))
+
+
+def test_json_wrapped_text_fields_are_unwrapped():
+    wrapped = json.dumps({"text": "チャットは見つかりませんでした。"}, ensure_ascii=False)
+    report = Report.model_validate({**REPORT, "limitations": wrapped})
+    assert report.limitations == "チャットは見つかりませんでした。"
+    assert Report.model_validate({**REPORT, "summary": "{本文}"}).summary == "{本文}"
 
 
 def test_findings_require_evidence():

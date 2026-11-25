@@ -2,6 +2,7 @@ import json
 from typing import Any
 
 import pytest
+from pydantic import SecretStr
 
 from pmoagent.agent import ReportGenerator, ToolAccessError
 from tests.conftest import REPORT, fake_query
@@ -29,7 +30,18 @@ async def test_claude_runs_with_agent_user_tokens_and_read_only_allow_list(setti
     assert options.mcp_servers["ado"]["headers"] == {"Authorization": "Bearer ado-token"}
     assert options.mcp_servers["teams"]["url"].endswith("/mcp_TeamsServer")
     assert options.env["AZURE_CLIENT_ID"] == "runtime-client"
+    assert "ANTHROPIC_FOUNDRY_API_KEY" not in options.env
     assert json.loads(call["prompt"])["instruction"] == "今週の報告"
+
+
+async def test_claude_api_key_replaces_entra_auth(settings):
+    settings.runtime_client_id = "runtime-client"
+    settings.anthropic_api_key = SecretStr("foundry-key")
+    _, call = await generate(settings)
+    env = call["options"].env
+    assert env["ANTHROPIC_FOUNDRY_API_KEY"] == "foundry-key"
+    assert "AZURE_CLIENT_ID" not in env
+    assert "foundry-key" not in repr(settings)
 
 
 async def guard_decision(settings, tool: str, tool_input: dict[str, Any]) -> str | None:
@@ -80,3 +92,34 @@ async def test_disconnected_mcp_server_fails_closed(settings):
     statuses = {"ado": "connected", "teams": "failed", "calendar": "connected"}
     with pytest.raises(ToolAccessError):
         await generate(settings, statuses=statuses)
+
+
+UNGROUNDED = {**REPORT, "next_actions": [{"text": "提案: 判定会で確認する"}]}
+
+
+def scripted_query(reports: list[dict[str, Any]], calls: list[dict[str, Any]]):
+    async def run(**kwargs: Any):
+        calls.append(kwargs)
+        source = fake_query(report=reports[min(len(calls), len(reports)) - 1])
+        async for message in source(**kwargs):
+            yield message
+
+    return run
+
+
+async def test_claude_retries_ungrounded_report_in_the_same_session(settings):
+    calls: list[dict[str, Any]] = []
+    generator = ReportGenerator(settings, scripted_query([UNGROUNDED, REPORT], calls))
+    report = await generator.generate("今週の報告", "", "", TOKENS)
+    assert report.summary == REPORT["summary"] and len(calls) == 2
+    assert calls[0]["options"].resume is None and calls[1]["options"].resume == "test"
+    assert calls[1]["options"].env["CLAUDE_CONFIG_DIR"].startswith(calls[0]["options"].cwd)
+    assert "検証に失敗しました" in calls[1]["prompt"]
+
+
+async def test_claude_gives_up_after_two_corrections(settings):
+    calls: list[dict[str, Any]] = []
+    generator = ReportGenerator(settings, scripted_query([UNGROUNDED], calls))
+    with pytest.raises(ValueError):
+        await generator.generate("今週の報告", "", "", TOKENS)
+    assert len(calls) == 3

@@ -49,6 +49,27 @@ def test_create_dry_run_builds_activity_autopilot_agent(capsys, provider):
     assert schemes == [{"type": "BotServiceRbac"}]
 
 
+def test_create_can_target_another_claude_resource_with_redacted_key(capsys, monkeypatch):
+    monkeypatch.setenv("PMO_ANTHROPIC_API_KEY", "foundry-key")
+    out, (version, _) = dry_run(
+        capsys, "create", "--project-endpoint", ENDPOINT, "--image", "i", "--model", "m",
+        "--ado-organization", "o", "--storage-account", "s",
+        "--anthropic-endpoint", "https://claude.services.ai.azure.com/api/projects/p",
+        "--anthropic-api-key-from-env",
+    )  # fmt: skip
+    env = version["definition"]["environment_variables"]
+    assert env["PMO_ANTHROPIC_ENDPOINT"] == "https://claude.services.ai.azure.com"
+    assert env["PMO_ANTHROPIC_API_KEY"] == "<redacted>" and "foundry-key" not in out
+
+
+def test_create_requires_the_api_key_when_requested(monkeypatch, tmp_path):
+    monkeypatch.delenv("PMO_ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SystemExit, match="PMO_ANTHROPIC_API_KEY"):
+        main(["create", "--project-endpoint", ENDPOINT, "--image", "i", "--model", "m",
+              "--ado-organization", "o", "--storage-account", "s", "--anthropic-api-key-from-env"])  # fmt: skip
+
+
 def test_publish_dry_run_is_group_autopilot_with_mcp_scopes(capsys):
     _, (body,) = dry_run(
         capsys, "publish", "--project-endpoint", ENDPOINT, "--blueprint-client-id", "bp",

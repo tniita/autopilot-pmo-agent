@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import quote, urlparse
 
-from pydantic import AliasChoices, Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ADO_LABEL = "ado"
@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     )
     provider: Literal["claude", "gpt"] = "claude"
     anthropic_model: str | None = Field(default=None, min_length=1)
+    # Foundry resource key for Claude. When unset, Claude uses Entra ID (default credential chain).
+    anthropic_api_key: SecretStr | None = Field(default=None, min_length=1)
+    # Foundry resource serving Claude, when it differs from the hosting project's resource.
+    anthropic_endpoint: str | None = None
     gpt_model: str | None = Field(default=None, min_length=1)
     ado_organization: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9-]{0,49}$")
     # Optional extra guard. The real boundary is the agent user's Azure DevOps access.
@@ -97,6 +101,26 @@ class Settings(BaseSettings):
             if not label or not tool or not tool.replace("_", "").isalnum():
                 raise ValueError(f"Invalid tool name: {name}")
         return tools
+
+    @field_validator("anthropic_endpoint")
+    @classmethod
+    def validate_anthropic_endpoint(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parsed = urlparse(value)
+        if (
+            parsed.scheme != "https"
+            or not (parsed.hostname or "").endswith(".services.ai.azure.com")
+            or parsed.username
+            or parsed.port
+            or parsed.path.strip("/")
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                "Expected a Foundry resource URL, e.g. https://x.services.ai.azure.com"
+            )
+        return value
 
     @model_validator(mode="after")
     def validate_settings(self) -> "Settings":
@@ -137,7 +161,8 @@ class Settings(BaseSettings):
 
     @property
     def anthropic_base_url(self) -> str:
-        return f"https://{urlparse(self.foundry_project_endpoint).hostname}/anthropic"
+        host = urlparse(self.anthropic_endpoint or self.foundry_project_endpoint).hostname
+        return f"https://{host}/anthropic"
 
     @property
     def openai_base_url(self) -> str:

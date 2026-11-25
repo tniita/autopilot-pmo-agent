@@ -14,7 +14,14 @@ from openai import AsyncOpenAI
 from openai.types.responses import FunctionToolParam
 from opentelemetry import trace
 
-from pmoagent.agent import SYSTEM_PROMPT, Evidence, ToolAccessError, report_prompt, tool_denial
+from pmoagent.agent import (
+    SYSTEM_PROMPT,
+    Evidence,
+    ToolAccessError,
+    correction_prompt,
+    report_prompt,
+    tool_denial,
+)
 from pmoagent.config import Settings
 from pmoagent.report import Report, report_schema
 
@@ -160,14 +167,7 @@ class GptReportGenerator:
                                     item.model_dump(exclude_none=True) for item in reply.output
                                 )
                                 messages.append(
-                                    {
-                                        "role": "user",
-                                        "content": f"この報告は検証に失敗しました: {str(error)[:1000]}\n"
-                                        "sources にはツール結果の文字列をそのまま書き写し、"
-                                        "work_item_ids には取得した ID だけを入れて、"
-                                        "スキーマどおりの JSON を返し直してください。"
-                                        "根拠がない項目は削除してください。",
-                                    }
+                                    {"role": "user", "content": correction_prompt(error)}
                                 )
                                 continue
                         messages.extend(item.model_dump(exclude_none=True) for item in reply.output)

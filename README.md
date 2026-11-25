@@ -143,6 +143,8 @@ flowchart LR
 
    実行すると、`blueprint_client_id` と `runtime_client_id` が表示されます。
    `--ado-project` には Azure DevOps 上の**正確なプロジェクト名**を指定します。指定しないと、モデルが依頼文中の通称をそのまま使い、`TF200016`（プロジェクトが存在しない）になることがあります。
+
+   Claude を別の Foundry リソースから API キーで呼ぶ場合は、`--anthropic-endpoint 'https://<リソース名>.services.ai.azure.com' --anthropic-api-key-from-env` を追加します。キーは環境変数または `.env` の `PMO_ANTHROPIC_API_KEY` から読み、ドライランでは伏せて表示します。キーはエージェント定義に平文で保存されるため、デモ用途に限ってください。この場合、手順 4 の推論ロールの付与は不要です。
 4. **既定インスタンスの ID に権限を付与します**（プロジェクトの Foundry User、会話用コンテナーの Storage Blob Data Contributor）。
 
    ```bash
@@ -313,6 +315,8 @@ az tag update --resource-id "$(out storageAccountId)" --operation Delete --tags 
 | `PMO_FOUNDRY_PROJECT_ENDPOINT` | 必須（Azure ではプラットフォームの `FOUNDRY_PROJECT_ENDPOINT` を使用） | Foundry プロジェクトのエンドポイント |
 | `PMO_PROVIDER` | `claude` | `claude` または `gpt`。どちらもグループ型 Autopilot |
 | `PMO_ANTHROPIC_MODEL` | Claude のとき必須 | Claude のデプロイ名 |
+| `PMO_ANTHROPIC_API_KEY` | なし（Entra ID） | Claude を Foundry リソースの API キーで認証する場合に指定。未指定なら既定の資格情報チェーン（Azure では実行 ID、ローカルでは `az login`）を使う。指定時は推論ロールは不要。Hosted Agent に設定するとエージェント定義の環境変数に平文で残るため、Azure では Entra ID を推奨（`create --anthropic-api-key-from-env` で設定） |
+| `PMO_ANTHROPIC_ENDPOINT` | なし（ホスト先と同じリソース） | Claude を、ホスト先プロジェクトとは別の Foundry リソース（例：`https://x.services.ai.azure.com`）から呼ぶ場合に指定。`create --anthropic-endpoint` で設定 |
 | `PMO_GPT_MODEL` | GPT のとき必須 | GPT のデプロイ名。カタログのモデル名とは別 |
 | `PMO_ADO_ORGANIZATION` | 必須 | Azure DevOps 組織名 |
 | `PMO_ADO_PROJECT` | なし（指定を推奨） | Azure DevOps の正確なプロジェクト名。モデルに伝え、ツール入力の `project` もこの名前に制限する。`create --ado-project` で設定 |

@@ -18,8 +18,36 @@ def _single_line(value: str) -> str:
     return " ".join(value.split())
 
 
+def _unwrap_text(value: str) -> str:
+    # Models sometimes wrap a plain field as {"text": "..."}; keep only the sentence.
+    stripped = value.strip()
+    if stripped.startswith("{"):
+        try:
+            parsed = json.loads(stripped)
+        except ValueError:
+            return value
+        if isinstance(parsed, dict) and isinstance(parsed.get("text"), str):
+            return str(parsed["text"])
+    return value
+
+
 class Finding(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # The JSON schema mirrors require_evidence so the model sees the rule up front.
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "anyOf": [
+                {
+                    "required": ["work_item_ids"],
+                    "properties": {"work_item_ids": {"type": "array", "minItems": 1}},
+                },
+                {
+                    "required": ["sources"],
+                    "properties": {"sources": {"type": "array", "minItems": 1}},
+                },
+            ]
+        },
+    )
 
     text: str = Field(min_length=1, max_length=220)
     work_item_ids: list[int] = Field(default_factory=list, max_length=8)
@@ -50,17 +78,25 @@ class Finding(BaseModel):
 class Report(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    summary: str = Field(min_length=1, max_length=600)
+    summary: str = Field(
+        min_length=1,
+        max_length=600,
+        description="報告の要点。JSONではなく日本語の文章で書く。",
+    )
     progress: list[Finding] = Field(max_length=4)
     issues: list[Finding] = Field(max_length=4)
     risks: list[Finding] = Field(max_length=4)
     next_actions: list[Finding] = Field(max_length=4)
-    limitations: str = Field(min_length=1, max_length=300)
+    limitations: str = Field(
+        min_length=1,
+        max_length=300,
+        description="読み手向けに、確認できなかった情報を日本語の文章で簡潔に書く。JSONにしない。",
+    )
 
     @field_validator("summary", "limitations")
     @classmethod
     def flatten(cls, value: str) -> str:
-        return _single_line(value)
+        return _single_line(_unwrap_text(value))
 
     def findings(self) -> list[Finding]:
         return self.progress + self.issues + self.risks + self.next_actions
